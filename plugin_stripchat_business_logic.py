@@ -1,391 +1,287 @@
 #!/usr/bin/env python3
-"""
-core_exploit.py
-Exploit seguro, automatizado y genérico basado en discovery_<program>.json
+"""Stripchat business-logic plugin.
 
-Realiza:
- - Self-IDOR
- - Reflected XSS no destructivo
- - Open redirect seguro
- - Inspección pasiva de WebSocket
- - Validación mínima de endpoints sensibles (auth / payment / upload / admin)
+Este plugin consume la salida de discovery/exploit y realiza comprobaciones
+específicas de Stripchat comparando el comportamiento entre los perfiles
+``viewer`` y ``model`` configurados en el programa.
 
-Todo conforme a BBP:
- • No se ataca a usuarios reales
- • No se fuerza autenticación ajena
- • No se modifica información de terceros
- • No se envían payloads peligrosos
- • Respeta rate-limit y cabeceras del programa
+Las verificaciones son de solo lectura y se limitan a peticiones GET con las
+cookies suministradas para cada rol. Se detectan accesos indebidos cuando el
+usuario *viewer* recibe respuestas equivalentes a las del perfil *model* en
+endpoints marcados como sensibles por `core_discovery`.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import os
 import sys
 import time
-import asyncio
-import websockets
-import aiohttp
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from datetime import datetime
-from typing import Dict, List, Any, Optional
-from urllib.parse import urlencode, urlparse, parse_qs
+from typing import Any, Dict, Iterable, List, Optional
+
+import requests
 
 
-# ===========================
-# DATA CLASSES
-# ===========================
+SENSITIVE_TYPES = {
+    "auth_flow_candidate",
+    "payment_logic_candidate",
+    "file_upload_candidate",
+    "admin_area_candidate",
+    "business_logic_candidate",
+}
+
+CONTENT_SIMILARITY_THRESHOLD = 150
+PROTECTED_STATUS_CODES = {401, 403}
+
 
 @dataclass
-class ExploitResult:
+class EndpointTest:
     issue_id: str
     issue_type: str
     endpoint_url: str
     method: str
-    success: bool
-    evidence: Dict[str, Any]
+    viewer_status: Optional[int]
+    model_status: Optional[int]
+    viewer_length: Optional[int]
+    model_length: Optional[int]
+    viewer_snippet: str
+    model_snippet: str
+    accessible_by_viewer: bool
     notes: str
 
 
 @dataclass
-class ExploitSummary:
+class PluginReport:
     program_id: str
     generated_at: str
-    results: List[ExploitResult]
+    tested_endpoints: List[EndpointTest]
+    findings: List[EndpointTest]
     stats: Dict[str, Any]
 
 
-# ===========================
-# CONFIG
-# ===========================
-
-def load_program_config(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    cfg.setdefault("exploit", {})
-    return cfg
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
-def load_discovery(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def load_json(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
 
 
-# ===========================
-# HTTP CLIENT
-# ===========================
+def load_cookies(path: str) -> Dict[str, str]:
+    """Acepta ficheros exportados desde navegadores o Burp."""
 
-class HttpClient:
-    """
-    Cliente seguro para requests automatizados.
-    Respeta rate-limit y añade headers del programa.
-    """
+    data = load_json(path)
+    cookies: Dict[str, str] = {}
 
-    def __init__(self, headers: Dict[str, str], rate_limit: float):
-        self.headers = headers
-        self.rate_limit = rate_limit
-        self._last_request = 0.0
+    if isinstance(data, list):
+        iterable: Iterable[Any] = data
+    else:
+        iterable = data.get("cookies", []) if isinstance(data, dict) else []
 
-    async def get(self, session: aiohttp.ClientSession, url: str, params=None):
-        await self._respect_rate()
-        try:
-            async with session.get(url, headers=self.headers, params=params, timeout=10) as resp:
-                body = await resp.text()
-                return resp.status, dict(resp.headers), body
-        except Exception as e:
-            return None, {}, f"error: {e}"
+    for entry in iterable:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        value = entry.get("value")
+        if not name or value is None:
+            continue
+        cookies[name] = value
 
-    async def _respect_rate(self):
+    return cookies
+
+
+class RateLimitedSession:
+    def __init__(self, headers: Dict[str, str], cookies: Dict[str, str], delay: float) -> None:
+        self._session = requests.Session()
+        if headers:
+            self._session.headers.update(headers)
+        for name, value in cookies.items():
+            # Dominio opcional; requests acepta None y lo aplica a todos los hosts.
+            self._session.cookies.set(name, value)
+        self._delay = max(delay, 0.0)
+        self._last_call = 0.0
+
+    def get(self, url: str) -> Optional[requests.Response]:
         now = time.time()
-        if now - self._last_request < self.rate_limit:
-            await asyncio.sleep(self.rate_limit)
-        self._last_request = time.time()
+        wait = self._delay - (now - self._last_call)
+        if wait > 0:
+            time.sleep(wait)
+        self._last_call = time.time()
+        try:
+            response = self._session.get(url, allow_redirects=True, timeout=12)
+        except requests.RequestException:
+            return None
+        return response
 
 
-# ===========================
-# PAYLOADS
-# ===========================
-
-SAFE_XSS_PAYLOAD = "<xss_test_safe>"
-
-SAFE_REDIRECT_TARGET = "https://example.com/"  # dominio neutro sin impacto
+def build_snippet(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    snippet = text[:400]
+    return snippet.replace("\n", " ")
 
 
-# ===========================
-# EXPLOIT IMPLEMENTATIONS
-# ===========================
+def responses_equivalent(viewer: Optional[requests.Response], model: Optional[requests.Response]) -> bool:
+    if viewer is None or model is None:
+        return False
+    if viewer.status_code in PROTECTED_STATUS_CODES:
+        return False
+    if viewer.status_code != model.status_code:
+        return False
 
-async def exploit_idor(issue: Dict[str, Any], session: aiohttp.ClientSession, http: HttpClient):
-    """
-    Self-IDOR:
-    • Extrae el parámetro sensible
-    • Cambia el ID por otro válido pero propio (ejemplo: +1 / -1)
-    • No usa IDs de otros usuarios
-    """
+    viewer_text = viewer.text or ""
+    model_text = model.text or ""
+    if not model_text:
+        return False
+
+    length_gap = abs(len(viewer_text) - len(model_text))
+    if length_gap > CONTENT_SIMILARITY_THRESHOLD:
+        return False
+
+    # Como heurística adicional, comprobamos que varias palabras clave de negocio
+    # aparezcan en la respuesta del viewer.
+    keywords = {"token", "price", "model", "private", "gold"}
+    matches = sum(1 for kw in keywords if kw in viewer_text.lower())
+    return matches >= 1
+
+
+def analyze_endpoint(issue: Dict[str, Any],
+                     viewer_session: RateLimitedSession,
+                     model_session: RateLimitedSession) -> EndpointTest:
     url = issue["endpoint_url"]
-    params = issue["params"]
+    method = issue.get("method", "GET").upper()
+    issue_id = issue.get("id", "unknown")
+    issue_type = issue.get("issue_type", "unknown")
 
-    parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
+    viewer_resp: Optional[requests.Response] = None
+    model_resp: Optional[requests.Response] = None
+    notes: List[str] = []
 
-    if not params:
-        return False, {"reason": "No params for IDOR"}
+    if method != "GET":
+        notes.append("Método no soportado (solo GET)")
+    else:
+        viewer_resp = viewer_session.get(url)
+        model_resp = model_session.get(url)
+        if viewer_resp is None:
+            notes.append("Error al solicitar con perfil viewer")
+        if model_resp is None:
+            notes.append("Error al solicitar con perfil model")
 
-    p = params[0]
+    accessible = responses_equivalent(viewer_resp, model_resp)
+    if accessible:
+        notes.append("Viewer obtiene respuesta equivalente a la del perfil model")
+    elif viewer_resp is not None and viewer_resp.status_code in PROTECTED_STATUS_CODES:
+        notes.append("Viewer recibe estado protegido (401/403)")
 
-    if p not in qs:
-        return False, {"reason": f"Param {p} not found in URL"}
-
-    try:
-        original_id = int(qs[p][0])
-    except:
-        return False, {"reason": f"Param {p} is not int"}
-
-    # Self-IDOR test: probamos ID adyacentes, sin atacar a terceros
-    test_ids = [original_id, original_id + 1, original_id - 1]
-
-    results = {}
-
-    for test_id in test_ids:
-        new_qs = dict(qs)
-        new_qs[p] = str(test_id)
-        new_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(new_qs, doseq=True)}"
-
-        status, headers, body = await http.get(session, new_url)
-
-        results[test_id] = {
-            "status": status,
-            "len": len(body) if body else 0
-        }
-
-    # Heurística simple: cambia la respuesta al variar ID?
-    base_len = results[original_id]["len"]
-    anomaly = any(abs(r["len"] - base_len) > 25 for r in results.values())
-
-    return anomaly, {"tests": results}
-
-
-async def exploit_xss(issue: Dict[str, Any], session: aiohttp.ClientSession, http: HttpClient):
-    """
-    Prueba de XSS reflejado segura:
-    • Inserta un marcador inofensivo <xss_test_safe>
-    • No ejecuta JS
-    • No realiza acciones peligrosas
-    """
-    url = issue["endpoint_url"]
-    params = issue["params"]
-
-    parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
-
-    if not params:
-        return False, {"reason": "no params xss"}
-
-    p = params[0]
-
-    new_qs = dict(qs)
-    new_qs[p] = SAFE_XSS_PAYLOAD
-
-    test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(new_qs, doseq=True)}"
-
-    status, headers, body = await http.get(session, test_url)
-
-    reflected = SAFE_XSS_PAYLOAD in body if body else False
-
-    return reflected, {
-        "status": status,
-        "reflected": reflected,
-        "body_snippet": body[:500] if body else ""
-    }
-
-
-async def exploit_redirect(issue: Dict[str, Any], session: aiohttp.ClientSession, http: HttpClient):
-    """
-    Open redirect seguro:
-    • Sustituye el parámetro redirect por un dominio neutral controlado
-    • No envía tráfico malicioso ni afecta usuarios
-    """
-    url = issue["endpoint_url"]
-    params = issue["params"]
-
-    parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
-
-    if not params:
-        return False, {"reason": "no redirect param"}
-
-    p = params[0]
-
-    new_qs = dict(qs)
-    new_qs[p] = SAFE_REDIRECT_TARGET
-
-    test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(new_qs, doseq=True)}"
-
-    status, headers, body = await http.get(session, test_url)
-
-    location = headers.get("Location", "")
-
-    return SAFE_REDIRECT_TARGET in location, {
-        "status": status,
-        "location": location
-    }
-
-
-async def exploit_ws(issue: Dict[str, Any]):
-    """
-    Inspección pasiva de WebSocket:
-    • Conecta 3 segundos
-    • Recibe mensajes
-    • No envía comandos
-    """
-    url = issue["endpoint_url"].replace("https://", "wss://").replace("http://", "ws://")
-
-    msgs = []
-    try:
-        async with websockets.connect(url) as ws:
-            start = time.time()
-            while time.time() - start < 3:
-                try:
-                    msg = await asyncio.wait_for(ws.recv(), timeout=1)
-                    msgs.append(msg[:500])
-                except:
-                    pass
-        return True, {"messages": msgs}
-    except Exception as e:
-        return False, {"error": str(e)}
-
-
-async def exploit_generic(issue: Dict[str, Any]):
-    """
-    Para tipos: auth_flow_candidate, payment_logic_candidate, file_upload_candidate, admin_area_candidate
-    Solo marcamos visibilidad / acceso basado en discovery.
-    """
-    return False, {"info": "generic check — requires manual / plugin analysis"}
-
-
-# ===========================
-# CORE EXPLOIT EXECUTION
-# ===========================
-
-ISSUE_HANDLERS = {
-    "idor_candidate": exploit_idor,
-    "xss_reflection_candidate": exploit_xss,
-    "open_redirect_candidate": exploit_redirect,
-    "ws_leak_candidate": exploit_ws,
-    "auth_flow_candidate": exploit_generic,
-    "payment_logic_candidate": exploit_generic,
-    "file_upload_candidate": exploit_generic,
-    "admin_area_candidate": exploit_generic,
-}
-
-
-async def run_exploit(program_cfg: Dict[str, Any],
-                      discovery: Dict[str, Any]) -> ExploitSummary:
-
-    program_id = discovery["program_id"]
-    issues = discovery["candidate_issues"]
-
-    # Limitamos cantidad según config
-    max_tests = program_cfg["exploit"].get("max_automatic_tests_per_endpoint", 10)
-    rate_limit = program_cfg.get("rate_limit", {}).get("default_delay", 0.15)
-
-    headers = program_cfg.get("headers", {})
-    http = HttpClient(headers=headers, rate_limit=rate_limit)
-
-    results = []
-
-    async with aiohttp.ClientSession() as session:
-        for idx, issue in enumerate(issues):
-            if idx >= 150:
-                break  # límite total razonable
-
-            issue_type = issue["issue_type"]
-            handler = ISSUE_HANDLERS.get(issue_type)
-
-            if not handler:
-                continue
-
-            print(f"[*] Probando issue {issue['id']} [{issue_type}]")
-
-            try:
-                success, evidence = await handler(issue, session, http) \
-                    if issue_type != "ws_leak_candidate" \
-                    else await handler(issue)
-            except Exception as e:
-                success, evidence = False, {"exception": str(e)}
-
-            result = ExploitResult(
-                issue_id=issue["id"],
-                issue_type=issue_type,
-                endpoint_url=issue["endpoint_url"],
-                method=issue["method"],
-                success=success,
-                evidence=evidence,
-                notes=""
-            )
-
-            results.append(result)
-
-    # Stats
-    stats = {
-        "total_issues": len(issues),
-        "tested": len(results),
-        "successes": sum(1 for r in results if r.success),
-        "generated_at": datetime.utcnow().isoformat() + "Z"
-    }
-
-    summary = ExploitSummary(
-        program_id=program_id,
-        generated_at=stats["generated_at"],
-        results=results,
-        stats=stats
+    test = EndpointTest(
+        issue_id=issue_id,
+        issue_type=issue_type,
+        endpoint_url=url,
+        method=method,
+        viewer_status=None if viewer_resp is None else viewer_resp.status_code,
+        model_status=None if model_resp is None else model_resp.status_code,
+        viewer_length=None if viewer_resp is None or viewer_resp.text is None else len(viewer_resp.text),
+        model_length=None if model_resp is None or model_resp.text is None else len(model_resp.text),
+        viewer_snippet="" if viewer_resp is None else build_snippet(viewer_resp.text),
+        model_snippet="" if model_resp is None else build_snippet(model_resp.text),
+        accessible_by_viewer=accessible,
+        notes="; ".join(notes),
     )
 
-    return summary
+    return test
 
 
-def save_exploit_summary(summary: ExploitSummary):
-    out_file = f"exploit_{summary.program_id}.json"
-    data = {
-        "program_id": summary.program_id,
-        "generated_at": summary.generated_at,
-        "results": [asdict(r) for r in summary.results],
-        "stats": summary.stats
+def generate_report(program_id: str,
+                    tests: List[EndpointTest]) -> PluginReport:
+    findings = [test for test in tests if test.accessible_by_viewer]
+    stats = {
+        "total_tested": len(tests),
+        "findings": len(findings),
+        "protected": sum(1 for test in tests if test.viewer_status in PROTECTED_STATUS_CODES),
     }
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    report = PluginReport(
+        program_id=program_id,
+        generated_at=datetime.utcnow().isoformat() + "Z",
+        tested_endpoints=tests,
+        findings=findings,
+        stats=stats,
+    )
+    return report
 
-    print(f"[+] Resultado guardado en {out_file}")
-    print(f"[+] Stats: {json.dumps(summary.stats, indent=2)}")
+
+def write_report(report: PluginReport) -> str:
+    output_file = f"plugin_stripchat_business_{report.program_id}.json"
+    payload = {
+        "program_id": report.program_id,
+        "generated_at": report.generated_at,
+        "stats": report.stats,
+        "tested_endpoints": [asdict(test) for test in report.tested_endpoints],
+        "findings": [asdict(test) for test in report.findings],
+    }
+    with open(output_file, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    return output_file
 
 
-# ===========================
+# ---------------------------------------------------------------------------
 # CLI
-# ===========================
-
-def parse_args():
-    p = argparse.ArgumentParser(description="core_exploit - Exploit seguro basado en discovery")
-    p.add_argument("--program-config", required=True)
-    p.add_argument("--discovery-file", help="Archivo discovery_<program>.json")
-    return p.parse_args()
+# ---------------------------------------------------------------------------
 
 
-def main():
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Stripchat business logic checks")
+    parser.add_argument("--program-config", required=True)
+    parser.add_argument("--discovery-file", required=True)
+    parser.add_argument("--exploit-file", help="Archivo exploit_<program>.json", default=None)
+    parser.add_argument("--viewer-session", required=True)
+    parser.add_argument("--model-session", required=True)
+    return parser.parse_args()
+
+
+def main() -> None:
     args = parse_args()
 
-    cfg = load_program_config(args.program_config)
-    program_id = cfg["id"]
-
-    disc_file = args.discovery_file or f"discovery_{program_id}.json"
-    if not os.path.isfile(disc_file):
-        print(f"[!] Discovery file not found: {disc_file}")
+    if not os.path.isfile(args.program_config):
+        print(f"[ERROR] Program config no encontrado: {args.program_config}")
+        sys.exit(1)
+    if not os.path.isfile(args.discovery_file):
+        print(f"[ERROR] Discovery file no encontrado: {args.discovery_file}")
         sys.exit(1)
 
-    print(f"[*] Cargando discovery desde: {disc_file}")
-    discovery = load_discovery(disc_file)
+    cfg = load_json(args.program_config)
+    program_id = cfg.get("id", "program")
 
-    summary = asyncio.run(run_exploit(cfg, discovery))
-    save_exploit_summary(summary)
+    discovery = load_json(args.discovery_file)
+    issues: List[Dict[str, Any]] = discovery.get("candidate_issues", [])
+
+    headers = cfg.get("headers", {}).copy()
+    rate_limit = cfg.get("rate_limit", {}).get("default_delay", 0.25)
+
+    viewer_cookies = load_cookies(args.viewer_session)
+    model_cookies = load_cookies(args.model_session)
+
+    viewer = RateLimitedSession(headers=headers, cookies=viewer_cookies, delay=rate_limit)
+    model = RateLimitedSession(headers=headers, cookies=model_cookies, delay=rate_limit)
+
+    tests: List[EndpointTest] = []
+
+    for issue in issues:
+        issue_type = issue.get("issue_type")
+        if issue_type not in SENSITIVE_TYPES:
+            continue
+        test = analyze_endpoint(issue, viewer, model)
+        tests.append(test)
+
+    report = generate_report(program_id, tests)
+    output_file = write_report(report)
+
+    print(f"[+] Plugin Stripchat completado. Resultados en {output_file}")
+    print(json.dumps(report.stats, indent=2))
 
 
 if __name__ == "__main__":

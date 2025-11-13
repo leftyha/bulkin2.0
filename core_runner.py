@@ -157,7 +157,7 @@ def run_pipeline(program_config: str,
         plugin_file = f"plugin_stripchat_business_{program_id}.json"
 
         cmd_plugin = [
-            sys.executable, "plugins/plugin_stripchat_business_logic.py",
+            sys.executable, "plugin_stripchat_business_logic.py",
             "--program-config", program_config,
             "--discovery-file", discovery_file,
             "--exploit-file", exploit_file,

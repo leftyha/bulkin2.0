@@ -1,0 +1,105 @@
+{
+  "program_name": "Stripchat",
+  "id": "stripchat",
+
+  "platform": "hackerone",
+
+  "scopes": {
+    "in_scope": [
+      {
+        "pattern": "\\.stripchat\\.com$",
+        "max_severity": "critical"
+      },
+      {
+        "pattern": "^go\\.stripchat\\.com$",
+        "min_severity": "high"
+      }
+    ],
+    "out_of_scope": [
+      "support.stripchat.com",
+      "wiki.stripchat.com",
+      "pxl.stripchat.com",
+      "mta.stripchat.com"
+    ]
+  },
+
+  "headers": {
+    "User-Agent": "bulkin/1.0"
+    /* "HackerOne": "<HANDLE>" se inyecta automáticamente si pasas --handle */
+  },
+
+  "rate_limit": {
+    "max_rps": 80,
+    "default_concurrency": 10,
+    "default_delay": 0.15
+  },
+
+  "base_targets": [
+    "https://stripchat.com",
+    "https://go.stripchat.com"
+  ],
+
+  "auth_profiles": [
+    {
+      "name": "viewer",
+      "login_flow": "manual",
+      "cookies_file": "sessions/stripchat_viewer.json"
+    },
+    {
+      "name": "model",
+      "login_flow": "manual",
+      "cookies_file": "sessions/stripchat_model.json"
+    }
+  ],
+
+  "recon": {
+    "enable_crtsh": true,
+    "enable_wayback": true,
+
+    "max_subdomains": 500,
+
+    "wordlist_file": "stripchat_wordlist.txt",
+    "max_fuzz_words": 200,
+    "max_hosts_for_fuzz": 8,
+
+    "capture_js": true,
+    "capture_html": true
+  },
+
+  "discovery": {
+    "interesting_keywords": [
+      "admin",
+      "model",
+      "stream",
+      "private",
+      "room",
+      "price",
+      "gold",
+      "broadcast",
+      "token",
+      "session",
+      "id",
+      "upload"
+    ],
+    "sensitive_param_names": [
+      "id",
+      "uid",
+      "modelId",
+      "userId",
+      "roomId",
+      "sessionId",
+      "token",
+      "price"
+    ]
+  },
+
+  "exploit": {
+    "allow_self_idor_only": true,
+    "enable_reflected_xss_checks": true,
+    "enable_open_redirect_checks": true,
+    "enable_ws_analysis": true,
+    "max_automatic_tests_per_endpoint": 10
+  },
+
+  "plugin": "plugin_stripchat_business_logic"
+}
